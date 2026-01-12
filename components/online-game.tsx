@@ -6,9 +6,8 @@ import { OnlineGameBoard } from "./online-game-board"
 import { OnlineGameStatus } from "./online-game-status"
 import { type OnlineBoard, getValidMovesOnline, checkWinnerOnline, getWinningCellsOnline } from "@/lib/game-ai"
 import { database } from "@/lib/firebase"
-import { ref, set, onValue, off, serverTimestamp } from "firebase/database" // serverTimestamp 추가
+import { ref, set, onValue, off, serverTimestamp } from "firebase/database"
 
-// Next.js 캐싱 방지용 강제 동적 렌더링 설정
 export const dynamic = 'force-dynamic'
 
 const BOARD_SIZE = 7
@@ -32,15 +31,42 @@ interface SerializedGameState {
   moveCount: number
   winner: "host" | "guest" | "none"
   winReason: WinReason
-  lastUpdate: any // Firebase 서버 시간을 담기 위해 수정
-  turnStartTime: any // Firebase 서버 시간을 담기 위해 수정
+  lastUpdate: any
+  turnStartTime: any
   rematchRequest: RematchRequest
 }
 
-// ... (기존 serializeBoard, deserializeBoard, createEmptyBoard 함수는 동일하게 유지)
+function serializeBoard(board: OnlineBoard): string {
+  const serialized = board.map((row) =>
+    row.map((cell) => {
+      if (cell === "host") return "H"
+      if (cell === "guest") return "G"
+      return "E"
+    }),
+  )
+  return JSON.stringify(serialized)
+}
+
+function deserializeBoard(data: string): OnlineBoard {
+  try {
+    const parsed = JSON.parse(data) as string[][]
+    return parsed.map((row) =>
+      row.map((cell) => {
+        if (cell === "H") return "host"
+        if (cell === "G") return "guest"
+        return null
+      }),
+    )
+  } catch {
+    return createEmptyBoard()
+  }
+}
+
+function createEmptyBoard(): OnlineBoard {
+  return Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null))
+}
 
 export function OnlineGame({ roomId, role, onExit }: OnlineGameProps) {
-  // ... (기존 State 선언 동일하게 유지)
   const [board, setBoard] = useState<OnlineBoard>(createEmptyBoard)
   const [currentPlayer, setCurrentPlayer] = useState<"host" | "guest">("host")
   const [lastMove, setLastMove] = useState<{ row: number; col: number } | null>(null)
@@ -56,66 +82,57 @@ export function OnlineGame({ roomId, role, onExit }: OnlineGameProps) {
   const [rematchRequest, setRematchRequest] = useState<RematchRequest>("none")
   const [showRematchModal, setShowRematchModal] = useState(false)
 
-  const logIdRef = useRef(0)
   const timerRef = useRef<NodeJS.Timeout | null>(null)
-  const lastUpdateRef = useRef<number>(0)
+  const isSpectator = role === "spectator"
+  const isMyTurn = !isSpectator && currentPlayer === role
+  const validMoves = winner ? [] : getValidMovesOnline(board, lastMove, currentPlayer)
 
-  // 핵심 수정: 실시간 리스너 강화
   useEffect(() => {
     const gameStateRef = ref(database, `rooms/${roomId}/gameState`)
     const unsubscribe = onValue(gameStateRef, (snapshot) => {
       const data = snapshot.val() as SerializedGameState | null
       if (!data) return
 
-      // 실시간 동기화를 위해 lastUpdateRef 체크 방식을 느슨하게 변경하거나 제거
       const newBoard = deserializeBoard(data.boardData)
-      const newLastMove = data.lastMoveRow >= 0 && data.lastMoveCol >= 0 ? { row: data.lastMoveRow, col: data.lastMoveCol } : null
-      
       setBoard(newBoard)
       setCurrentPlayer(data.currentPlayer)
-      setLastMove(newLastMove)
+      setLastMove(data.lastMoveRow >= 0 ? { row: data.lastMoveRow, col: data.lastMoveCol } : null)
       setMoveCount(data.moveCount)
       setWinner(data.winner === "none" ? null : data.winner)
       setWinReason(data.winReason || "none")
-      // Firebase 서버에서 받은 턴 시작 시간을 로컬 상태로 반영
-      if (data.turnStartTime) setTurnStartTime(data.turnStartTime) 
+      if (data.turnStartTime) setTurnStartTime(data.turnStartTime)
 
       if (data.winner !== "none") {
         setWinningCells(getWinningCellsOnline(newBoard))
         setShowRematchModal(true)
+      } else {
+        setShowRematchModal(false)
       }
     })
     return () => off(gameStateRef)
   }, [roomId])
 
-  // 핵심 수정: 타이머 동기화 로직
   useEffect(() => {
     if (winner || !connected) return
-    
     const updateTimer = () => {
-      // Date.now()와 서버에서 받아온 turnStartTime의 오차를 계산
       const elapsed = Math.floor((Date.now() - turnStartTime) / 1000)
-      const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed)
-      setTimeLeft(remaining)
+      setTimeLeft(Math.max(0, TURN_TIME_LIMIT - elapsed))
     }
-
     timerRef.current = setInterval(updateTimer, 500)
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
   }, [winner, connected, turnStartTime])
 
-  // 핵심 수정: 착수 시 serverTimestamp() 사용
   const handleCellClick = useCallback(async (row: number, col: number) => {
-    if (winner || currentPlayer !== role || !connected) return
+    if (winner || !isMyTurn || !connected) return
+    if (!validMoves.some(m => m.row === row && m.col === col)) return
 
-    const newBoard = board.map((r) => [...r])
+    const newBoard = board.map(r => [...r])
     newBoard[row][col] = role as "host" | "guest"
     const nextPlayer = role === "host" ? "guest" : "host"
-
     const gameWinner = checkWinnerOnline(newBoard)
 
     try {
-      const gameStateRef = ref(database, `rooms/${roomId}/gameState`)
-      await set(gameStateRef, {
+      await set(ref(database, `rooms/${roomId}/gameState`), {
         boardData: serializeBoard(newBoard),
         currentPlayer: nextPlayer,
         lastMoveRow: row,
@@ -123,18 +140,40 @@ export function OnlineGame({ roomId, role, onExit }: OnlineGameProps) {
         moveCount: moveCount + 1,
         winner: gameWinner || "none",
         winReason: gameWinner ? "connect4" : "none",
-        lastUpdate: serverTimestamp(), // 내 컴 시계가 아닌 서버 시계 사용!
-        turnStartTime: serverTimestamp(), // 다음 사람 턴도 서버 시계로 시작!
+        lastUpdate: serverTimestamp(),
+        turnStartTime: serverTimestamp(),
         rematchRequest: "none",
       })
-    } catch (error) {
-      console.error("Firebase update error:", error)
-    }
-  }, [board, winner, currentPlayer, role, connected, roomId, moveCount])
+    } catch (e) { console.error(e) }
+  }, [board, winner, isMyTurn, connected, roomId, role, moveCount, validMoves])
 
-  // ... (이하 나머지 렌더링 부분은 기존 코드 유지)
+  const resetGame = async () => {
+    await set(ref(database, `rooms/${roomId}/gameState`), {
+      boardData: serializeBoard(createEmptyBoard()),
+      currentPlayer: "host",
+      lastMoveRow: -1,
+      lastMoveCol: -1,
+      moveCount: 0,
+      winner: "none",
+      winReason: "none",
+      lastUpdate: serverTimestamp(),
+      turnStartTime: serverTimestamp(),
+      rematchRequest: "none",
+    })
+  }
+
   return (
-    // ... (기존 return 코드와 동일)
-    <div className="flex min-h-screen ..."> ... </div>
+    <div className="flex min-h-screen flex-col items-center justify-center gap-8 p-4 md:flex-row">
+      <OnlineGameStatus 
+        currentPlayer={currentPlayer} winner={winner} isMyTurn={isMyTurn} 
+        role={role} connected={connected} onReset={resetGame} 
+        onExit={onExit} moveCount={moveCount} timeLeft={timeLeft}
+      />
+      <OnlineGameBoard 
+        board={board} validMoves={isMyTurn ? validMoves : []} 
+        lastMove={lastMove} winningCells={winningCells} 
+        onCellClick={handleCellClick} disabled={!isMyTurn || !!winner}
+      />
+    </div>
   )
 }
